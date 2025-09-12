@@ -1,7 +1,8 @@
 from sqlmodel import SQLModel, Field, Relationship
 from enum import Enum
-from datetime import datetime,date
+from datetime import datetime
 from typing import Optional, List, Literal
+from pydantic import EmailStr
 
 # --- User Model ---
 
@@ -14,20 +15,26 @@ class Role(Enum):
 class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(unique=True, index=True) # This will be the email
-    password: str = Field(max_length=60, index=True)
-    role: Role = Field(default=Role.USER, index=True)
+    password: str
+    role: Role = Field(default=Role.USER)
     
     # Profile Fields
     first_name: Optional[str] = Field(default=None)
     last_name: Optional[str] = Field(default=None)
     company: Optional[str] = Field(default=None)
     job_title: Optional[str] = Field(default=None)
-    avatar_url: Optional[str] = Field(default=None) # <-- Add avatar URL field
+    avatar_url: Optional[str] = Field(default=None)
+
+    # --- NEW: Fields for Verification and Password Reset ---
+    is_verified: bool = Field(default=False)
+    verification_code: Optional[str] = Field(default=None)
+    reset_token: Optional[str] = Field(default=None, index=True)
+    reset_token_expires: Optional[datetime] = Field(default=None)
 
     meetings: List["Meeting"] = Relationship(back_populates="user")
 
 class CreateUser(SQLModel):
-    username: str
+    username: EmailStr
     password: str
     full_name: str
 
@@ -39,12 +46,21 @@ class UserUpdate(SQLModel):
     
 class UserProfile(SQLModel):
     id: int
-    username: str
+    username: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     company: Optional[str] = None
     job_title: Optional[str] = None
-    avatar_url: Optional[str] = None # <-- Add avatar URL field
+    avatar_url: Optional[str] = None
+
+# --- NEW: Request Body Models for Auth ---
+class VerificationRequest(SQLModel):
+    email: EmailStr
+    code: str
+
+class ResetPasswordRequest(SQLModel):
+    token: str
+    password: str
 
 # --- JWT Token Model ---
 
@@ -86,3 +102,4 @@ class Meeting(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     user: Optional[User] = Relationship(back_populates="meetings")
+
