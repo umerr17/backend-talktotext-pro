@@ -447,7 +447,7 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
             f"--- TRANSCRIPT ---\n{transcript_text}"
         )
         
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content(full_prompt)
         notes_text = response.text or "Notes could not be generated."
         update_task_progress(task_id, TaskStatus.PROCESSING, "Saving results...", 95)
