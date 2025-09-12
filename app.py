@@ -40,7 +40,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "60"))
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 
-# --- NEW: Environment-specific config ---
+# --- Environment-specific config ---
 APP_ENV = os.getenv("APP_ENV", "development")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
@@ -88,13 +88,13 @@ create_db_and_tables()
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://talktotext-pro.vercel.app"], # Add your production frontend URL
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://talktotext-pro.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- NEW: Environment-aware Session Middleware ---
+# --- Environment-aware Session Middleware ---
 if APP_ENV == "production":
     app.add_middleware(
         SessionMiddleware,
@@ -267,7 +267,6 @@ async def login_for_access_token(session: SessionDependency, form_data: Annotate
 
 @app.get("/login/google")
 async def login_google(request: Request):
-    # This will now correctly build the full https URL in production
     redirect_uri = request.url_for('auth_google')
     return await oauth.google.authorize_redirect(request, str(redirect_uri))
 
@@ -276,7 +275,6 @@ async def auth_google(request: Request, session: SessionDependency):
     try:
         token = await oauth.google.authorize_access_token(request)
     except Exception as e:
-        # This is where the CSRF error originates
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Could not authorize access token: {e}")
     
     user_info = token.get('userinfo')
@@ -612,7 +610,7 @@ async def get_dashboard_stats(session: SessionDependency, current_user: CurrentU
     meeting_statement = select(func.count(Meeting.id)).where(Meeting.user_id == current_user.id)
     total_meetings = session.exec(meeting_statement).one()
 
-    hours_processed = total_meetings * 0.3
+    hours_processed = total_meetings * 0.3 # Assuming avg 18 mins per meeting
     accuracy_rate = 98.5
     team_members = 1 
 
