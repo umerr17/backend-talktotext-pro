@@ -1,0 +1,11 @@
+sqlmodel
+fastapi
+assemblyai
+google-generativeai
+bcrypt
+passlib
+cloudinary
+python-jose
+python-dotenv
+python-multipart
+uvicorn
