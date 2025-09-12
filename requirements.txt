@@ -9,3 +9,5 @@ python-jose
 python-dotenv
 python-multipart
 uvicorn
+pydantic
+pydantic[email]
