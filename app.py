@@ -14,7 +14,7 @@ import smtplib
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware # <-- IMPORT THIS
+from starlette.middleware.sessions import SessionMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse, RedirectResponse
 from jose import jwt, JWTError
@@ -40,14 +40,19 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "60"))
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 
+# --- NEW: Environment-specific config ---
+APP_ENV = os.getenv("APP_ENV", "development")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# --- NEW: Google OAuth Config ---
+# --- Google OAuth Config ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
-# --- NEW: Email Config ---
+# --- Email Config ---
 SMTP_SERVER = os.getenv("MAIL_SERVER")
 SMTP_PORT = int(os.getenv("MAIL_PORT", 587))
 SMTP_USERNAME = os.getenv("MAIL_USERNAME")
@@ -83,18 +88,28 @@ create_db_and_tables()
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://www.talktotextpro.online"], # Add your production frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- FIX: Add Session Middleware for OAuth ---
-# This middleware must be installed to access request.session
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+# --- NEW: Environment-aware Session Middleware ---
+if APP_ENV == "production":
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=SECRET_KEY,
+        https_only=True,
+        same_site='none'
+    )
+else:  # development
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=SECRET_KEY
+    )
 
 
-# --- NEW: OAuth Setup ---
+# --- OAuth Setup ---
 oauth = OAuth()
 oauth.register(
     name='google',
@@ -129,7 +144,6 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode.update({"exp": int(expire.timestamp())})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     
-# --- NEW: Email Sending Utility ---
 def send_email(to_email: str, subject: str, body: str):
     if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL]):
         print("!!! SMTP settings not configured. Printing email to console instead. !!!")
@@ -207,7 +221,6 @@ async def register_user(new_user: CreateUser, session: SessionDependency):
     session.commit()
     session.refresh(user)
 
-    # Send verification email
     send_email(
         to_email=user.username,
         subject="Verify Your TalkToText Pro Account",
@@ -229,7 +242,7 @@ async def verify_email(request: VerificationRequest, session: SessionDependency)
         raise HTTPException(status_code=400, detail="Invalid verification code.")
     
     user.is_verified = True
-    user.verification_code = None # Clear the code
+    user.verification_code = None
     session.add(user)
     session.commit()
     
@@ -254,15 +267,17 @@ async def login_for_access_token(session: SessionDependency, form_data: Annotate
 
 @app.get("/login/google")
 async def login_google(request: Request):
-    redirect_uri = "http://127.0.0.1:8000/auth/google"
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+    # This will now correctly build the full https URL in production
+    redirect_uri = request.url_for('auth_google')
+    return await oauth.google.authorize_redirect(request, str(redirect_uri))
 
 @app.get("/auth/google")
 async def auth_google(request: Request, session: SessionDependency):
     try:
         token = await oauth.google.authorize_access_token(request)
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+        # This is where the CSRF error originates
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Could not authorize access token: {e}")
     
     user_info = token.get('userinfo')
     if not user_info:
@@ -274,11 +289,11 @@ async def auth_google(request: Request, session: SessionDependency):
     if not user:
         user = User(
             username=email,
-            password=get_password_hash(str(uuid.uuid4())),  # Create a random password
+            password=get_password_hash(str(uuid.uuid4())),
             first_name=user_info.get('given_name'),
             last_name=user_info.get('family_name'),
             avatar_url=user_info.get('picture'),
-            is_verified=True # Google accounts are pre-verified
+            is_verified=True
         )
         session.add(user)
         session.commit()
@@ -290,8 +305,7 @@ async def auth_google(request: Request, session: SessionDependency):
         expires_delta=access_token_expires
     )
     
-    frontend_url = "http://localhost:3000"
-    return RedirectResponse(url=f"{frontend_url}/auth/callback?token={access_token}")
+    return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?token={access_token}")
 
 
 @app.post("/forgot-password", status_code=status.HTTP_200_OK)
@@ -304,7 +318,7 @@ async def forgot_password(request: ForgotPasswordRequest, session: SessionDepend
         session.add(user)
         session.commit()
         
-        reset_link = f"http://localhost:3000/reset-password?token={reset_token}"
+        reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
         send_email(
             to_email=user.username,
             subject="Password Reset Request for TalkToText Pro",
@@ -447,7 +461,7 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
             f"--- TRANSCRIPT ---\n{transcript_text}"
         )
         
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(full_prompt)
         notes_text = response.text or "Notes could not be generated."
         update_task_progress(task_id, TaskStatus.PROCESSING, "Saving results...", 95)
