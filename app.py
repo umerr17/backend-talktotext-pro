@@ -1,5 +1,6 @@
 # main.py
 import os
+import re
 import shutil
 import uuid
 import time
@@ -21,6 +22,7 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from sqlmodel import Session, select, col, func
+from sqlalchemy import text
 from authlib.integrations.starlette_client import OAuth
 
 import assemblyai as aai
@@ -448,6 +450,8 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
         transcript_text = transcript.text or "Could not transcribe audio."
         update_task_progress(task_id, TaskStatus.PROCESSING, "Generating meeting notes with AI...", 70)
         
+        # --- PROMPT MODIFICATION ---
+        # The new prompt now asks for a "Meeting Category" section at the end.
         full_prompt = (
             "You are an expert meeting notes assistant. Transform the following meeting transcript into structured meeting notes. "
             "Your output must be professional, clear, and the length of the response should be according to the transcription length. "
@@ -456,6 +460,8 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
             "The required sections, each with a '###' heading, are: "
             "### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, and ### Sentiment Analysis. "
             "For Sentiment Analysis, provide a single word (Positive, Neutral, or Negative) followed by a brief justification.\n\n"
+            "**Finally, add a new section at the very end called '### Meeting Category'.** In this section, provide a single, one or two-word category for this meeting based on its content. "
+            "Example categories: Team Sync, Client Call, Product Review, Brainstorming, Interview, Presentation.\n\n"
             f"--- TRANSCRIPT ---\n{transcript_text}"
         )
         
@@ -607,17 +613,168 @@ async def delete_meeting(meeting_id: int, session: SessionDependency, current_us
 
 @app.get("/dashboard/stats")
 async def get_dashboard_stats(session: SessionDependency, current_user: CurrentUser):
+    # Total Meetings
     meeting_statement = select(func.count(Meeting.id)).where(Meeting.user_id == current_user.id)
-    total_meetings = session.exec(meeting_statement).one()
+    total_meetings = session.exec(meeting_statement).one_or_none() or 0
 
-    hours_processed = total_meetings * 0.3 # Assuming avg 18 mins per meeting
+    # Meetings in the last 7 days for the bar chart
+    last_7_days = datetime.now(timezone.utc) - timedelta(days=7)
+    meetings_over_time_statement = (
+        select(
+            func.date(Meeting.created_at).label("date"),
+            func.count(Meeting.id).label("count")
+        )
+        .where(Meeting.user_id == current_user.id)
+        .where(Meeting.created_at >= last_7_days)
+        .group_by(func.date(Meeting.created_at))
+        .order_by(func.date(Meeting.created_at))
+    )
+    meetings_over_time = session.exec(meetings_over_time_statement).all()
+    
+    # Create a dictionary of the last 7 days initialized to 0
+    date_range = [(last_7_days + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(8)]
+    meetings_data = {day: 0 for day in date_range}
+    
+    # Populate with actual data
+    for row in meetings_over_time:
+        meetings_data[row.date] = row.count
+
+    # Format for the frontend
+    meetings_chart_data = [{"date": date, "meetings": count} for date, count in meetings_data.items()]
+
+
+    # Task status distribution for the pie chart
+    status_distribution_statement = (
+        select(
+            ProcessingTask.status,
+            func.count(ProcessingTask.id).label("count")
+        )
+        .where(ProcessingTask.user_id == current_user.id)
+        .group_by(ProcessingTask.status)
+    )
+    status_distribution_raw = session.exec(status_distribution_statement).all()
+    status_distribution = {status.value: count for status, count in status_distribution_raw}
+
+
+    # Mockup some additional stats for a richer dashboard
+    hours_processed = total_meetings * 0.3  # Assuming avg 18 mins per meeting
     accuracy_rate = 98.5
-    team_members = 1 
+    team_members = 1
 
     return {
         "total_meetings": total_meetings,
         "hours_processed": round(hours_processed, 1),
         "team_members": team_members,
-        "accuracy_rate": accuracy_rate
+        "accuracy_rate": accuracy_rate,
+        "meetings_over_time": meetings_chart_data,
+        "status_distribution": status_distribution
     }
 
+@app.get("/dashboard/weekly-activity")
+async def get_weekly_activity(session: SessionDependency, current_user: CurrentUser):
+    """
+    Returns the number of meetings processed per day for the last 7 days.
+    """
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=6)
+    
+    # This SQL function is database-agnostic for grabbing day-of-week data
+    # For SQLite: strftime('%w', created_at) returns 0 for Sunday, 6 for Saturday
+    
+    query = (
+        select(
+            # --- THIS IS THE CORRECTED LINE ---
+            func.strftime('%w', Meeting.created_at).label("day_of_week"),
+            func.count(Meeting.id).label("meeting_count")
+        )
+        .where(
+            Meeting.user_id == current_user.id,
+            Meeting.created_at >= start_date,
+            Meeting.created_at <= end_date
+        )
+        .group_by("day_of_week") # Grouping by the label is cleaner
+    )
+    
+    results = session.exec(query).all()
+    
+    daily_counts = {day: 0 for day in range(7)}
+    for row in results:
+        daily_counts[int(row.day_of_week)] = row.meeting_count
+
+    # Create a list for the last 7 days in order
+    days_in_order = [(end_date - timedelta(days=i)) for i in range(6, -1, -1)]
+    day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+    final_data = []
+    for day in days_in_order:
+        day_index = int(day.strftime("%w"))
+        final_data.append({
+            "day": day_names[day_index],
+            "meetings": daily_counts.get(day_index, 0)
+        })
+
+    return final_data
+
+@app.get("/dashboard/meeting-types")
+async def get_meeting_types(session: SessionDependency, current_user: CurrentUser):
+    """
+    Categorizes meetings by parsing the 'Meeting Category' from the AI-generated notes.
+    """
+    statement = select(Meeting.notes).where(Meeting.user_id == current_user.id)
+    notes_list = session.exec(statement).all()
+    
+    category_counts = {}
+    
+    # This regex will find the text after '### Meeting Category' until the next heading or end of string
+    category_pattern = re.compile(r"### Meeting Category\s*\n(.*?)(?=\n###|\Z)", re.DOTALL)
+    
+    for notes in notes_list:
+        match = category_pattern.search(notes)
+        if match:
+            category = match.group(1).strip()
+            if category:
+                category_counts[category] = category_counts.get(category, 0) + 1
+    
+    return [{"name": name, "value": count} for name, count in category_counts.items()]
+
+
+@app.get("/dashboard/processing-speed")
+async def get_processing_speed(session: SessionDependency, current_user: CurrentUser):
+    """
+    Calculates processing duration by comparing task and meeting creation times.
+    """
+    query = (
+        select(ProcessingTask.created_at, Meeting.created_at)
+        .join(Meeting, ProcessingTask.id == Meeting.task_id)
+        .where(ProcessingTask.user_id == current_user.id)
+        .where(ProcessingTask.status == TaskStatus.COMPLETED)
+    )
+    
+    results = session.exec(query).all()
+    
+    durations_in_minutes = []
+    for task_start, meeting_end in results:
+        duration = (meeting_end - task_start).total_seconds() / 60
+        durations_in_minutes.append(duration)
+        
+    speed_buckets = {
+        "0-5min": 0,
+        "5-10min": 0,
+        "10-15min": 0,
+        "15-20min": 0,
+        "20+min": 0
+    }
+    
+    for duration in durations_in_minutes:
+        if duration <= 5:
+            speed_buckets["0-5min"] += 1
+        elif duration <= 10:
+            speed_buckets["5-10min"] += 1
+        elif duration <= 15:
+            speed_buckets["10-15min"] += 1
+        elif duration <= 20:
+            speed_buckets["15-20min"] += 1
+        else:
+            speed_buckets["20+min"] += 1
+            
+    return [{"time": name, "count": count} for name, count in speed_buckets.items()]
