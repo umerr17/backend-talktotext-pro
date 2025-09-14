@@ -457,55 +457,23 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
         if transcript.status == aai.TranscriptStatus.error:
             raise Exception(f"Transcription failed: {transcript.error}")
 
-        original_transcript_text = transcript.text or "Could not transcribe audio."
-        language_code = transcript.json_response.get('language_code', 'en')
+        transcript_text = transcript.text or "Could not transcribe audio."
+        update_task_progress(task_id, TaskStatus.PROCESSING, "Generating meeting notes with AI...", 70)
         
-        update_task_progress(task_id, TaskStatus.PROCESSING, "Generating notes with AI...", 60)
-
-        english_transcript_text = original_transcript_text
-        notes_text = "Notes could not be generated."
-        if language_code and not language_code.startswith('en'):
-            combined_prompt = (
-                f"You are an expert linguistic assistant. The following transcript is in a non-English language ({language_code}). "
-                "Your task is to perform two steps and provide the output in a specific, structured format.\n\n"
-                "STEP 1: Translate the entire transcript accurately into English.\n"
-                "STEP 2: Using the English translation you just created, generate professional meeting notes. The notes must include these sections, each with a '###' heading: ### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, ### Sentiment Analysis, and ### Meeting Category.\n\n"
-                "**IMPORTANT**: Your final output MUST strictly follow this format, with nothing before or after these tags:\n\n"
-                "<TRANSLATED_TRANSCRIPT>\n"
-                "[Your full English translation of the transcript goes here]\n"
-                "</TRANSLATED_TRANSCRIPT>\n\n"
-                "<MEETING_NOTES>\n"
-                "[Your structured meeting notes go here, starting with ### Executive Summary]\n"
-                "</MEETING_NOTES>\n\n"
-                f"--- ORIGINAL TRANSCRIPT ---\n{original_transcript_text}"
-            )
-
-            model = genai.GenerativeModel('gemini-2.5-flash')
-            response = model.generate_content(combined_prompt)
-            full_response_text = response.text or ""
-
-            translated_match = re.search(r"<TRANSLATED_TRANSCRIPT>(.*?)</TRANSLATED_TRANSCRIPT>", full_response_text, re.DOTALL)
-            notes_match = re.search(r"<MEETING_NOTES>(.*?)</MEETING_NOTES>", full_response_text, re.DOTALL)
-
-            english_transcript_text = translated_match.group(1).strip() if translated_match else "[[Translation Failed]]"
-            notes_text = notes_match.group(1).strip() if notes_match else "[[Note Generation Failed]]"
-        else:
-            note_generation_prompt = (
-                 "You are an expert meeting notes assistant. Transform the following meeting transcript into structured meeting notes. "
-                 "Your output must be professional, clear, and the length of the response should be according to the transcription length. "
-                 "**Important**: Do not include any conversational preamble, introduction, or any text before the first section. "
-                 "Your response must begin directly with the '### Executive Summary' heading. "
-                 "The required sections, each with a '###' heading, are: "
-                 "### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, and ### Sentiment Analysis. "
-                 "For Sentiment Analysis, provide a single word (Positive, Neutral, or Negative) followed by a brief justification.\n\n"
-                 "**Finally, add a new section at the very end called '### Meeting Category'.** In this section, provide a single, one or two-word category for this meeting based on its content. "
-                 "Example categories: Team Sync, Client Call, Product Review, Brainstorming, Interview, Presentation.\n\n"
-                 f"--- TRANSCRIPT ---\n{original_transcript_text}"
-            )
-            model = genai.GenerativeModel('gemini-2.5-flash')
-            response = model.generate_content(note_generation_prompt)
-            notes_text = response.text or "Notes could not be generated."
-
+        full_prompt = (
+            "You are an expert meeting notes assistant. Transform the following meeting transcript into structured meeting notes. "
+            "Your output must be professional, clear, and the length of the response should be according to the transcription length. "
+            "**Important**: Do not include any conversational preamble, introduction, or any text before the first section. "
+            "Your response must begin directly with the '### Executive Summary' heading. "
+            "The required sections, each with a '###' heading, are: "
+            "### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, and ### Sentiment Analysis. "
+            "For Sentiment Analysis, provide a single word (Positive, Neutral, or Negative) followed by a brief justification.\n\n"
+            f"--- TRANSCRIPT ---\n{transcript_text}"
+        )
+        
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(full_prompt)
+        notes_text = response.text or "Notes could not be generated."
         update_task_progress(task_id, TaskStatus.PROCESSING, "Saving results...", 95)
         
         with Session(engine) as session:
