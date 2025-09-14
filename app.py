@@ -1,5 +1,6 @@
 # main.py
 import os
+import re
 import shutil
 import uuid
 import time
@@ -21,6 +22,7 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from sqlmodel import Session, select, col, func
+from sqlalchemy import text
 from authlib.integrations.starlette_client import OAuth
 
 import assemblyai as aai
@@ -122,6 +124,10 @@ oauth.register(
 # -------- Pydantic Models --------
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+
+# Add this class definition near your other Pydantic models
+class ShareRequest(BaseModel):
+    recipient_email: EmailStr
 
 # -------- Utility functions --------
 def get_password_hash(password: str) -> str:
@@ -416,11 +422,16 @@ def update_task_progress(task_id: str, status: TaskStatus, details: str, progres
             session.commit()
 
 def process_audio_task(task_id: str, file_path: str, user_id: int, original_filename: str):
+    # Keep track of all temporary files for easy cleanup
+    cleanup_paths = [file_path]
     file_to_process = file_path
+    temp_dir = "temp_uploads" # Define temp directory once
     
     _, file_extension = os.path.splitext(file_path)
     if file_extension.lower() != ".mp3":
-        audio_file_path = f"temp_audio_{task_id}.mp3"
+        # CHANGE 1: Save the converted file in the same temp directory
+        audio_file_path = os.path.join(temp_dir, f"temp_audio_{task_id}.mp3")
+        cleanup_paths.append(audio_file_path) # Add new file to the cleanup list
 
         try:
             update_task_progress(task_id, TaskStatus.PROCESSING, "Converting file to MP3...", 10)
@@ -433,42 +444,79 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
             file_to_process = audio_file_path
         except subprocess.CalledProcessError as e:
             update_task_progress(task_id, TaskStatus.ERROR, f"Conversion failed: {e.stderr}", 0)
+            # The finally block will still run and clean up all files in cleanup_paths
             return
     
     try:
         update_task_progress(task_id, TaskStatus.PROCESSING, "Transcribing audio (this may take a while)...", 20)
         
-        config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.universal)
+        config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.nano, language_detection=True)
         transcriber = aai.Transcriber(config=config)
         transcript = transcriber.transcribe(file_to_process)
 
         if transcript.status == aai.TranscriptStatus.error:
             raise Exception(f"Transcription failed: {transcript.error}")
 
-        transcript_text = transcript.text or "Could not transcribe audio."
-        update_task_progress(task_id, TaskStatus.PROCESSING, "Generating meeting notes with AI...", 70)
+        original_transcript_text = transcript.text or "Could not transcribe audio."
+        language_code = transcript.json_response.get('language_code', 'en')
         
-        full_prompt = (
-            "You are an expert meeting notes assistant. Transform the following meeting transcript into structured meeting notes. "
-            "Your output must be professional, clear, and the length of the response should be according to the transcription length. "
-            "**Important**: Do not include any conversational preamble, introduction, or any text before the first section. "
-            "Your response must begin directly with the '### Executive Summary' heading. "
-            "The required sections, each with a '###' heading, are: "
-            "### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, and ### Sentiment Analysis. "
-            "For Sentiment Analysis, provide a single word (Positive, Neutral, or Negative) followed by a brief justification.\n\n"
-            f"--- TRANSCRIPT ---\n{transcript_text}"
-        )
-        
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(full_prompt)
-        notes_text = response.text or "Notes could not be generated."
+        update_task_progress(task_id, TaskStatus.PROCESSING, "Generating notes with AI...", 60)
+
+        english_transcript_text = original_transcript_text
+        notes_text = "Notes could not be generated."
+        if language_code and not language_code.startswith('en'):
+            combined_prompt = (
+                f"You are an expert linguistic assistant. The following transcript is in a non-English language ({language_code}). "
+                "Your task is to perform two steps and provide the output in a specific, structured format.\n\n"
+                "STEP 1: Translate the entire transcript accurately into English.\n"
+                "STEP 2: Using the English translation you just created, generate professional meeting notes. The notes must include these sections, each with a '###' heading: ### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, ### Sentiment Analysis, and ### Meeting Category.\n\n"
+                "**IMPORTANT**: Your final output MUST strictly follow this format, with nothing before or after these tags:\n\n"
+                "<TRANSLATED_TRANSCRIPT>\n"
+                "[Your full English translation of the transcript goes here]\n"
+                "</TRANSLATED_TRANSCRIPT>\n\n"
+                "<MEETING_NOTES>\n"
+                "[Your structured meeting notes go here, starting with ### Executive Summary]\n"
+                "</MEETING_NOTES>\n\n"
+                f"--- ORIGINAL TRANSCRIPT ---\n{original_transcript_text}"
+            )
+
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            response = model.generate_content(combined_prompt)
+            full_response_text = response.text or ""
+
+            translated_match = re.search(r"<TRANSLATED_TRANSCRIPT>(.*?)</TRANSLATED_TRANSCRIPT>", full_response_text, re.DOTALL)
+            notes_match = re.search(r"<MEETING_NOTES>(.*?)</MEETING_NOTES>", full_response_text, re.DOTALL)
+
+            english_transcript_text = translated_match.group(1).strip() if translated_match else "[[Translation Failed]]"
+            notes_text = notes_match.group(1).strip() if notes_match else "[[Note Generation Failed]]"
+        else:
+            note_generation_prompt = (
+                 "You are an expert meeting notes assistant. Transform the following meeting transcript into structured meeting notes. "
+                 "Your output must be professional, clear, and the length of the response should be according to the transcription length. "
+                 "**Important**: Do not include any conversational preamble, introduction, or any text before the first section. "
+                 "Your response must begin directly with the '### Executive Summary' heading. "
+                 "The required sections, each with a '###' heading, are: "
+                 "### Executive Summary, ### Key Discussion Points, ### Decisions Made, ### Action Items, and ### Sentiment Analysis. "
+                 "For Sentiment Analysis, provide a single word (Positive, Neutral, or Negative) followed by a brief justification.\n\n"
+                 "**Finally, add a new section at the very end called '### Meeting Category'.** In this section, provide a single, one or two-word category for this meeting based on its content. "
+                 "Example categories: Team Sync, Client Call, Product Review, Brainstorming, Interview, Presentation.\n\n"
+                 f"--- TRANSCRIPT ---\n{original_transcript_text}"
+            )
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            response = model.generate_content(note_generation_prompt)
+            notes_text = response.text or "Notes could not be generated."
+
         update_task_progress(task_id, TaskStatus.PROCESSING, "Saving results...", 95)
+        
         with Session(engine) as session:
             meeting_title = os.path.splitext(original_filename)[0].replace("_", " ").title()
+            
             meeting = Meeting(
                 user_id=user_id,
                 title=meeting_title,
-                transcript=transcript_text,
+                transcript=original_transcript_text,
+                transcript_en=english_transcript_text,
+                original_language=language_code,
                 notes=notes_text,
                 task_id=task_id
             )
@@ -489,10 +537,10 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
     except Exception as exc:
         update_task_progress(task_id, TaskStatus.ERROR, str(exc), 0)
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        if file_to_process != file_path and os.path.exists(file_to_process):
-            os.remove(file_to_process)
+        # CHANGE 2: Robust cleanup logic using the list of paths
+        for path in cleanup_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 # -------- Core Application Endpoints -------- #
 @app.post("/upload-audio")
@@ -605,19 +653,217 @@ async def delete_meeting(meeting_id: int, session: SessionDependency, current_us
     session.commit()
     return
 
+@app.post("/meetings/{meeting_id}/share", status_code=status.HTTP_200_OK)
+async def share_meeting_by_email(
+    meeting_id: int,
+    share_request: ShareRequest,
+    session: SessionDependency,
+    current_user: CurrentUser
+):
+    statement = select(Meeting).where(Meeting.id == meeting_id)
+    meeting = session.exec(statement).first()
+
+    # Verify the meeting exists and belongs to the user
+    if not meeting or meeting.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Format the email content from the stored notes
+    email_subject = f"Meeting Notes: {meeting.title}"
+
+    # Simple text formatting for the email. You can enhance this with HTML later.
+    # This removes the '###' markdown headers for a cleaner look.
+    formatted_notes = re.sub(r'###\s*(.*?)\s*\n', r'\1\n\n', meeting.notes)
+    email_body = f"""
+Hello,
+
+Please find the notes for the meeting "{meeting.title}", shared by {current_user.first_name or current_user.username}.
+
+Date: {meeting.created_at.strftime('%Y-%m-%d')}
+--------------------------------------------------
+
+{formatted_notes}
+
+--------------------------------------------------
+Generated by TalkToText Pro.
+    """
+
+    # Use the existing email utility to send the message
+    try:
+        send_email(
+            to_email=share_request.recipient_email,
+            subject=email_subject,
+            body=email_body.strip()
+        )
+    except Exception as e:
+        # Handle potential SMTP errors
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+
+    return {"message": "Meeting notes sent successfully."}
+
 @app.get("/dashboard/stats")
 async def get_dashboard_stats(session: SessionDependency, current_user: CurrentUser):
+    # Total Meetings
     meeting_statement = select(func.count(Meeting.id)).where(Meeting.user_id == current_user.id)
-    total_meetings = session.exec(meeting_statement).one()
+    total_meetings = session.exec(meeting_statement).one_or_none() or 0
 
-    hours_processed = total_meetings * 0.3 # Assuming avg 18 mins per meeting
+    # Meetings in the last 7 days for the bar chart
+    last_7_days = datetime.now(timezone.utc) - timedelta(days=7)
+    meetings_over_time_statement = (
+        select(
+            func.date(Meeting.created_at).label("date"),
+            func.count(Meeting.id).label("count")
+        )
+        .where(Meeting.user_id == current_user.id)
+        .where(Meeting.created_at >= last_7_days)
+        .group_by(func.date(Meeting.created_at))
+        .order_by(func.date(Meeting.created_at))
+    )
+    meetings_over_time = session.exec(meetings_over_time_statement).all()
+    
+    # Create a dictionary of the last 7 days initialized to 0
+    date_range = [(last_7_days + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(8)]
+    meetings_data = {day: 0 for day in date_range}
+    
+    # Populate with actual data
+    for row in meetings_over_time:
+        meetings_data[row.date] = row.count
+
+    # Format for the frontend
+    meetings_chart_data = [{"date": date, "meetings": count} for date, count in meetings_data.items()]
+
+
+    # Task status distribution for the pie chart
+    status_distribution_statement = (
+        select(
+            ProcessingTask.status,
+            func.count(ProcessingTask.id).label("count")
+        )
+        .where(ProcessingTask.user_id == current_user.id)
+        .group_by(ProcessingTask.status)
+    )
+    status_distribution_raw = session.exec(status_distribution_statement).all()
+    status_distribution = {status.value: count for status, count in status_distribution_raw}
+
+
+    # Mockup some additional stats for a richer dashboard
+    hours_processed = total_meetings * 0.3  # Assuming avg 18 mins per meeting
     accuracy_rate = 98.5
-    team_members = 1 
+    team_members = 1
 
     return {
         "total_meetings": total_meetings,
         "hours_processed": round(hours_processed, 1),
         "team_members": team_members,
-        "accuracy_rate": accuracy_rate
+        "accuracy_rate": accuracy_rate,
+        "meetings_over_time": meetings_chart_data,
+        "status_distribution": status_distribution
     }
 
+@app.get("/dashboard/weekly-activity")
+async def get_weekly_activity(session: SessionDependency, current_user: CurrentUser):
+    """
+    Returns the number of meetings processed per day for the last 7 days.
+    """
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=6)
+    
+    # This SQL function is database-agnostic for grabbing day-of-week data
+    # For SQLite: strftime('%w', created_at) returns 0 for Sunday, 6 for Saturday
+    
+    query = (
+        select(
+            # --- THIS IS THE CORRECTED LINE ---
+            func.strftime('%w', Meeting.created_at).label("day_of_week"),
+            func.count(Meeting.id).label("meeting_count")
+        )
+        .where(
+            Meeting.user_id == current_user.id,
+            Meeting.created_at >= start_date,
+            Meeting.created_at <= end_date
+        )
+        .group_by("day_of_week") # Grouping by the label is cleaner
+    )
+    
+    results = session.exec(query).all()
+    
+    daily_counts = {day: 0 for day in range(7)}
+    for row in results:
+        daily_counts[int(row.day_of_week)] = row.meeting_count
+
+    # Create a list for the last 7 days in order
+    days_in_order = [(end_date - timedelta(days=i)) for i in range(6, -1, -1)]
+    day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+    final_data = []
+    for day in days_in_order:
+        day_index = int(day.strftime("%w"))
+        final_data.append({
+            "day": day_names[day_index],
+            "meetings": daily_counts.get(day_index, 0)
+        })
+
+    return final_data
+
+@app.get("/dashboard/meeting-types")
+async def get_meeting_types(session: SessionDependency, current_user: CurrentUser):
+    """
+    Categorizes meetings by parsing the 'Meeting Category' from the AI-generated notes.
+    """
+    statement = select(Meeting.notes).where(Meeting.user_id == current_user.id)
+    notes_list = session.exec(statement).all()
+    
+    category_counts = {}
+    
+    # This regex will find the text after '### Meeting Category' until the next heading or end of string
+    category_pattern = re.compile(r"### Meeting Category\s*\n(.*?)(?=\n###|\Z)", re.DOTALL)
+    
+    for notes in notes_list:
+        match = category_pattern.search(notes)
+        if match:
+            category = match.group(1).strip()
+            if category:
+                category_counts[category] = category_counts.get(category, 0) + 1
+    
+    return [{"name": name, "value": count} for name, count in category_counts.items()]
+
+
+@app.get("/dashboard/processing-speed")
+async def get_processing_speed(session: SessionDependency, current_user: CurrentUser):
+    """
+    Calculates processing duration by comparing task and meeting creation times.
+    """
+    query = (
+        select(ProcessingTask.created_at, Meeting.created_at)
+        .join(Meeting, ProcessingTask.id == Meeting.task_id)
+        .where(ProcessingTask.user_id == current_user.id)
+        .where(ProcessingTask.status == TaskStatus.COMPLETED)
+    )
+    
+    results = session.exec(query).all()
+    
+    durations_in_minutes = []
+    for task_start, meeting_end in results:
+        duration = (meeting_end - task_start).total_seconds() / 60
+        durations_in_minutes.append(duration)
+        
+    speed_buckets = {
+        "0-5min": 0,
+        "5-10min": 0,
+        "10-15min": 0,
+        "15-20min": 0,
+        "20+min": 0
+    }
+    
+    for duration in durations_in_minutes:
+        if duration <= 5:
+            speed_buckets["0-5min"] += 1
+        elif duration <= 10:
+            speed_buckets["5-10min"] += 1
+        elif duration <= 15:
+            speed_buckets["10-15min"] += 1
+        elif duration <= 20:
+            speed_buckets["15-20min"] += 1
+        else:
+            speed_buckets["20+min"] += 1
+            
+    return [{"time": name, "count": count} for name, count in speed_buckets.items()]

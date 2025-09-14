@@ -100,6 +100,8 @@ class Meeting(SQLModel, table=True):
     transcript: str
     notes: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    original_language: Optional[str] = Field(default=None)
+    transcript_en: Optional[str] = Field(default=None)
 
     user: Optional[User] = Relationship(back_populates="meetings")
 
