@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import shutil
@@ -70,6 +69,7 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 if not all([SECRET_KEY, ASSEMBLYAI_API_KEY, GOOGLE_API_KEY, CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET]):
     raise EnvironmentError("Missing required environment variables")
 
+#audio to text transcription using assembly ai
 # -------- Initialize clients / settings --------
 aai.settings.api_key = ASSEMBLYAI_API_KEY
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -318,7 +318,7 @@ async def forgot_password(request: ForgotPasswordRequest, session: SessionDepend
     if user:
         reset_token = str(uuid.uuid4())
         user.reset_token = reset_token
-        user.reset_token_expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        user.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
         session.add(user)
         session.commit()
         
@@ -336,7 +336,7 @@ async def reset_password(request: ResetPasswordRequest, session: SessionDependen
     statement = select(User).where(User.reset_token == request.token)
     user = session.exec(statement).first()
 
-    if not user or user.reset_token_expires < datetime.now(timezone.utc):
+    if not user or user.reset_token_expires < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Invalid or expired password reset token.")
     
     user.password = get_password_hash(request.password)
