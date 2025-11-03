@@ -5,12 +5,11 @@ import uuid
 import time
 import subprocess
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Optional
+from typing import Annotated
 import random
 import string
 from email.mime.text import MIMEText
 import smtplib
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, BackgroundTasks, Request
@@ -20,7 +19,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse, RedirectResponse
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, HttpUrl
+from pydantic import BaseModel, EmailStr
 from sqlmodel import Session, select, col, func
 from sqlalchemy import text
 from authlib.integrations.starlette_client import OAuth
@@ -29,7 +28,6 @@ import assemblyai as aai
 import google.generativeai as genai
 import cloudinary
 import cloudinary.uploader
-import yt_dlp
 
 
 from database import create_db_and_tables, engine, SessionDependency
@@ -130,11 +128,6 @@ class ForgotPasswordRequest(BaseModel):
 # Add this class definition near your other Pydantic models
 class ShareRequest(BaseModel):
     recipient_email: EmailStr
-
-# --- NEW: Model for Link Upload ---
-class LinkUploadRequest(BaseModel):
-    url: HttpUrl
-    filename: Optional[str] = None
 
 # -------- Utility functions --------
 def get_password_hash(password: str) -> str:
@@ -544,62 +537,10 @@ def process_audio_task(task_id: str, file_path: str, user_id: int, original_file
     except Exception as exc:
         update_task_progress(task_id, TaskStatus.ERROR, str(exc), 0)
     finally:
-        # --- MODIFIED: Improved cleanup logic ---
+        # CHANGE 2: Robust cleanup logic using the list of paths
         for path in cleanup_paths:
             if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    # Log cleanup error but don't fail the task
-                    print(f"Failed to clean up temp file {path}: {e}")
-
-# --- NEW: Background task for processing a link ---
-def process_link_task(task_id: str, url: str, user_id: int, original_filename: str):
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Download to a file named after the task_id, extension will be added by yt-dlp
-    file_path_template = os.path.join(temp_dir, f"{task_id}.%(ext)s")
-    downloaded_file_path = None
-    
-    try:
-        update_task_progress(task_id, TaskStatus.PROCESSING, "Downloading from link...", 5)
-        
-        # yt-dlp options to get the best audio and convert it to mp3
-        ydl_opts = {
-            'outtmpl': file_path_template,
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            # The file will be named {task_id}.mp3 after postprocessing
-            downloaded_file_path = os.path.join(temp_dir, f"{task_id}.mp3")
-            
-            # Use provided filename, or fallback to video title
-            if not original_filename or original_filename.startswith("linked_meeting"):
-                    final_filename = info_dict.get('title', 'linked_meeting') + ".mp3"
-            else:
-                    final_filename = original_filename
-
-        if not downloaded_file_path or not os.path.exists(downloaded_file_path):
-            raise Exception("Failed to download or extract audio from link.")
-
-        update_task_progress(task_id, TaskStatus.PROCESSING, "File downloaded, processing audio...", 10)
-        
-        # Pass to the main processor. It will handle cleanup.
-        process_audio_task(task_id, downloaded_file_path, user_id, final_filename)
-
-    except Exception as e:
-        update_task_progress(task_id, TaskStatus.ERROR, f"Failed to process link: {str(e)}", 0)
-        # If download fails, we might still have a partial file. Clean it up.
-        if downloaded_file_path and os.path.exists(downloaded_file_path):
-            os.remove(downloaded_file_path)
+                os.remove(path)
 
 # -------- Core Application Endpoints -------- #
 @app.post("/upload-audio")
@@ -642,40 +583,6 @@ async def upload_audio(
     session.commit()
     
     background_tasks.add_task(process_audio_task, task_id, file_path, current_user.id, file.filename)
-
-    return {"task_id": task_id, "status": "Started"}
-
-# --- NEW: Endpoint for uploading a link ---
-@app.post("/upload-link")
-async def upload_link(
-    link_request: LinkUploadRequest,
-    current_user: CurrentUser,
-    session: SessionDependency,
-    background_tasks: BackgroundTasks,
-):
-    task_id = str(uuid.uuid4())
-    
-    original_filename = link_request.filename
-    if not original_filename:
-        try:
-            # Try to get a decent name from the URL
-            parsed_url = urlparse(str(link_request.url))
-            original_filename = os.path.basename(parsed_url.path) or f"meeting_from_{parsed_url.netloc}"
-        except Exception:
-            original_filename = f"linked_meeting_{task_id}"
-    
-    new_task = ProcessingTask(
-        id=task_id,
-        user_id=current_user.id,
-        original_filename=original_filename, # Use the filename
-        status=TaskStatus.PENDING,
-        details="Link received, task queued.",
-        progress_percent=1
-    )
-    session.add(new_task)
-    session.commit()
-    
-    background_tasks.add_task(process_link_task, task_id, str(link_request.url), current_user.id, original_filename)
 
     return {"task_id": task_id, "status": "Started"}
 
